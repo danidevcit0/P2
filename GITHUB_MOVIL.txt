@@ -1,0 +1,18 @@
+# Compilar el APK SOLO con el móvil
+
+Este proyecto incluye un GitHub Actions workflow.
+
+1. Crea una cuenta/repositorio en GitHub desde el móvil.
+2. Sube todos los archivos del ZIP a la raíz del repositorio.
+3. En GitHub abre `Actions`.
+4. Selecciona `Build PS202 APK`.
+5. Pulsa `Run workflow`.
+6. Espera a que termine.
+7. Abre la ejecución terminada.
+8. En `Artifacts` descarga `PS202-Game-Manager-APK`.
+9. Descomprime el ZIP descargado y encontrarás el `.apk`.
+10. Instálalo en el teléfono.
+
+El build se ejecuta en los servidores de GitHub; no necesitas Linux ni PC local.
+
+El proyecto usa Buildozer para empaquetar la aplicación Kivy. El workflow sigue el patrón documentado por Buildozer y la acción oficial/comunitaria usada en ejemplos de Kivy.
