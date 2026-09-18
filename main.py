@@ -53,19 +53,30 @@ class SAFTree:
         self.cache.clear()
 
     def root_uri(self):
-        return DocumentsContract.buildDocumentUriUsingTree(
+        uri = DocumentsContract.buildDocumentUriUsingTree(
             self.tree_uri, self.root_doc_id
         )
+        if uri is None:
+            raise RuntimeError("SAF: no se pudo construir la URI raíz de la USB.")
+        return uri
 
-    def list_children(self, directory_uri):
-        key = str(directory_uri)
+    def list_children(self, directory_uri=None, parent_doc_id=None):
+        key = str(directory_uri) if directory_uri is not None else "DOCID:" + str(parent_doc_id)
         if key in self.cache:
             return self.cache[key]
+
+        if parent_doc_id is None:
+            if directory_uri is None:
+                raise RuntimeError("SAF: carpeta URI nula al listar contenido.")
+            parent_doc_id = DocumentsContract.getDocumentId(directory_uri)
+
+        if parent_doc_id is None or str(parent_doc_id) == "":
+            raise RuntimeError("SAF: Android no devolvió el documentId de la carpeta.")
 
         children = {}
         children_uri = DocumentsContract.buildChildDocumentsUriUsingTree(
             self.tree_uri,
-            DocumentsContract.getDocumentId(directory_uri)
+            parent_doc_id
         )
 
         projection = [
@@ -77,29 +88,27 @@ class SAFTree:
         cursor = self.resolver.query(
             children_uri, projection, None, None, None
         )
+
         if cursor is None:
             return children
 
         try:
-            id_index = cursor.getColumnIndex(
-                Document.COLUMN_DOCUMENT_ID
-            )
-            name_index = cursor.getColumnIndex(
-                Document.COLUMN_DISPLAY_NAME
-            )
-            mime_index = cursor.getColumnIndex(
-                Document.COLUMN_MIME_TYPE
-            )
+            id_index = cursor.getColumnIndex(Document.COLUMN_DOCUMENT_ID)
+            name_index = cursor.getColumnIndex(Document.COLUMN_DISPLAY_NAME)
+            mime_index = cursor.getColumnIndex(Document.COLUMN_MIME_TYPE)
 
             while cursor.moveToNext():
                 doc_id = cursor.getString(id_index)
                 name = cursor.getString(name_index)
                 mime = cursor.getString(mime_index)
+
                 child_uri = DocumentsContract.buildDocumentUriUsingTree(
                     self.tree_uri, doc_id
                 )
+
                 children[name] = {
                     "uri": child_uri,
+                    "doc_id": doc_id,
                     "name": name,
                     "mime": mime,
                     "is_dir": mime == self.DIR_MIME
@@ -116,12 +125,28 @@ class SAFTree:
             return self.root_uri()
 
         current_uri = self.root_uri()
+        current_doc_id = self.root_doc_id
+
+        if current_uri is None or current_doc_id is None:
+            raise RuntimeError("SAF: no se pudo obtener la raíz de la USB.")
+
         for part in relative_path.split("/"):
-            children = self.list_children(current_uri)
+            children = self.list_children(
+                current_uri,
+                parent_doc_id=current_doc_id
+            )
             item = children.get(part)
             if item is None:
                 return None
+
             current_uri = item["uri"]
+            current_doc_id = item.get("doc_id")
+
+            if current_uri is None or current_doc_id is None:
+                raise RuntimeError(
+                    "SAF: Android devolvió una URI/documentId nulo para: " + part
+                )
+
         return current_uri
 
     def read_bytes(self, relative_path):
