@@ -38,38 +38,199 @@ Intent = autoclass("android.content.Intent")
 Activity = autoclass("android.app.Activity")
 DocumentsContract = autoclass("android.provider.DocumentsContract")
 Document = autoclass("android.provider.DocumentsContract$Document")
+Uri = autoclass("android.net.Uri")
 REQUEST_USB_TREE = 5001
 
 
 class SAFTree:
     DIR_MIME = "vnd.android.document/directory"
 
+    @staticmethod
+    def _java_string(value):
+        """Convierte de forma segura un String Java/PyJNIus a str Python."""
+        if value is None:
+            return None
+        try:
+            return value.toString()
+        except Exception:
+            return str(value)
+
+    @classmethod
+    def _normalize_uri(cls, value, label="URI"):
+        """
+        Fuerza una URI nueva de Android a partir de su texto.
+
+        Esto evita pasar directamente a ContentResolver un wrapper PyJNIus
+        que pueda haber quedado como una referencia Java no valida.
+        """
+        if value is None:
+            raise RuntimeError("SAF: {} es NULL.".format(label))
+
+        try:
+            text = cls._java_string(value)
+        except Exception as e:
+            raise RuntimeError(
+                "SAF: no se pudo convertir {} a texto: {}".format(label, e)
+            )
+
+        if text is None:
+            raise RuntimeError("SAF: {} produjo texto NULL.".format(label))
+
+        text = text.strip()
+        if not text:
+            raise RuntimeError("SAF: {} produjo texto vacío.".format(label))
+
+        try:
+            parsed = Uri.parse(text)
+        except Exception as e:
+            raise RuntimeError(
+                "SAF: Uri.parse() falló para {}: {}\nTexto={}".format(
+                    label, e, text
+                )
+            )
+
+        if parsed is None:
+            raise RuntimeError(
+                "SAF: Uri.parse() devolvió NULL para {}.\nTexto={}".format(
+                    label, text
+                )
+            )
+
+        try:
+            scheme = cls._java_string(parsed.getScheme())
+            authority = cls._java_string(parsed.getAuthority())
+        except Exception as e:
+            raise RuntimeError(
+                "SAF: no se pudo inspeccionar {}: {}\nTexto={}".format(
+                    label, e, text
+                )
+            )
+
+        if not scheme or not authority:
+            raise RuntimeError(
+                "SAF: {} no parece una URI content válida.\n"
+                "scheme={} authority={} texto={}".format(
+                    label, scheme, authority, text
+                )
+            )
+
+        return parsed
+
+    @classmethod
+    def _uri_debug(cls, uri):
+        if uri is None:
+            return "NULL"
+        try:
+            text = cls._java_string(uri)
+        except Exception:
+            text = "<no se pudo obtener toString()>"
+        try:
+            scheme = cls._java_string(uri.getScheme())
+        except Exception:
+            scheme = "?"
+        try:
+            authority = cls._java_string(uri.getAuthority())
+        except Exception:
+            authority = "?"
+        try:
+            path = cls._java_string(uri.getPath())
+        except Exception:
+            path = "?"
+        return "text={} | scheme={} | authority={} | path={}".format(
+            text, scheme, authority, path
+        )
+
     def __init__(self, tree_uri):
-        self.tree_uri = tree_uri
-        self.resolver = MainActivity.mActivity.getContentResolver()
-        self.root_doc_id = DocumentsContract.getTreeDocumentId(tree_uri)
+        # IMPORTANTE: NO guardamos objetos Java Uri/ContentResolver para
+        # reutilizarlos desde otro hilo. PyJNIus puede representarlos como
+        # LocalRef; al pasar de on_activity_result (UI) al worker ese ref
+        # puede quedar inválido (el traceback mostraba self=<LocalRef obj=0x0>).
+        # Guardamos únicamente texto Python y creamos los objetos Java en el
+        # mismo hilo que realiza cada operación SAF.
+        tree_text = self._java_string(tree_uri)
+        if tree_text is None or not tree_text.strip():
+            raise RuntimeError("SAF: treeUri seleccionada es NULL/vacía.")
+        tree_text = tree_text.strip()
+
+        # Parseo inicial solo para validar y obtener el documentId. El objeto
+        # Java NO se conserva como atributo de la clase.
+        tree_obj = self._normalize_uri(tree_text, "treeUri seleccionada")
+        self.tree_uri_text = tree_text
+
+        try:
+            root_id = DocumentsContract.getTreeDocumentId(tree_obj)
+        except Exception as e:
+            raise RuntimeError(
+                "SAF: no se pudo obtener getTreeDocumentId().\n"
+                "treeUri: {}\n{}".format(
+                    self._uri_debug(tree_obj), e
+                )
+            )
+
+        self.root_doc_id = self._java_string(root_id)
+        if self.root_doc_id is None or not self.root_doc_id.strip():
+            raise RuntimeError(
+                "SAF: getTreeDocumentId() devolvió NULL/vacío.\n"
+                "treeUri: {}".format(self._uri_debug(tree_obj))
+            )
+        self.root_doc_id = self.root_doc_id.strip()
         self.cache = {}
+
+    def _fresh_tree_uri(self):
+        # Cada llamada obtiene un objeto Uri nuevo en el hilo actual.
+        return self._normalize_uri(self.tree_uri_text, "treeUri actual")
+
+    def _fresh_resolver(self):
+        # No conservamos ContentResolver obtenido en otro hilo.
+        activity_obj = Activity.mActivity
+        if activity_obj is None:
+            raise RuntimeError("SAF: PythonActivity.mActivity es NULL.")
+        resolver = activity_obj.getContentResolver()
+        if resolver is None:
+            raise RuntimeError("SAF: ContentResolver es NULL.")
+        return resolver
 
     def clear_cache(self):
         self.cache.clear()
 
     def root_uri(self):
-        uri = DocumentsContract.buildDocumentUriUsingTree(
-            self.tree_uri, self.root_doc_id
-        )
-        if uri is None:
-            raise RuntimeError("SAF: no se pudo construir la URI raíz de la USB.")
-        return uri
+        tree_uri = self._fresh_tree_uri()
+        try:
+            raw_uri = DocumentsContract.buildDocumentUriUsingTree(
+                tree_uri, self.root_doc_id
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "SAF: buildDocumentUriUsingTree() falló para la raíz.\n"
+                "documentId={}\nTREE={}\n{}".format(
+                    self.root_doc_id, self.tree_uri_text, e
+                )
+            )
+
+        return self._normalize_uri(raw_uri, "URI raíz")
 
     def list_children(self, directory_uri=None, parent_doc_id=None, debug_path="/"):
-        key = str(directory_uri) if directory_uri is not None else "DOCID:" + str(parent_doc_id)
-        if key in self.cache:
-            return self.cache[key]
-
-        if self.tree_uri is None:
-            raise RuntimeError(
-                "SAF: la URI raíz de la USB es nula al listar: {}".format(debug_path)
+        if directory_uri is not None:
+            directory_uri = self._normalize_uri(
+                directory_uri, "URI carpeta {}".format(debug_path)
             )
+            cache_key = "URI:" + self._java_string(directory_uri)
+        else:
+            cache_key = "DOCID:" + str(parent_doc_id)
+
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        if not self.tree_uri_text:
+            raise RuntimeError(
+                "SAF: la URI raíz de la USB es nula/vacía al listar: {}".format(
+                    debug_path
+                )
+            )
+
+        # Todos los objetos Java usados en query() se crean en ESTE hilo.
+        tree_uri = self._fresh_tree_uri()
+        resolver = self._fresh_resolver()
 
         if parent_doc_id is None:
             if directory_uri is None:
@@ -85,28 +246,37 @@ class SAFTree:
                     )
                 )
 
-        if parent_doc_id is None or str(parent_doc_id) == "":
+        parent_doc_id = self._java_string(parent_doc_id)
+        if parent_doc_id is None or not parent_doc_id.strip():
             raise RuntimeError(
                 "SAF: documentId vacío para la carpeta: {}".format(debug_path)
             )
+        parent_doc_id = parent_doc_id.strip()
 
         children = {}
         try:
-            children_uri = DocumentsContract.buildChildDocumentsUriUsingTree(
-                self.tree_uri,
+            raw_children_uri = DocumentsContract.buildChildDocumentsUriUsingTree(
+                tree_uri,
                 parent_doc_id
             )
         except Exception as e:
             raise RuntimeError(
                 "SAF: no se pudo construir URI de hijos para: {}\n"
-                "documentId={}\n{}".format(debug_path, parent_doc_id, e)
+                "documentId={}\nTREE={}\n{}".format(
+                    debug_path,
+                    parent_doc_id,
+                    self.tree_uri_text,
+                    e
+                )
             )
 
-        if children_uri is None:
-            raise RuntimeError(
-                "SAF: Android devolvió URI de hijos nula para: {}\n"
-                "documentId={}".format(debug_path, parent_doc_id)
-            )
+        # IMPORTANTE: crear una URI nueva desde texto antes de query().
+        # El traceback anterior mostraba un wrapper android.net.Uri en Python,
+        # pero ContentResolver.query() terminaba recibiendo uri=NULL.
+        children_uri = self._normalize_uri(
+            raw_children_uri,
+            "URI hijos {}".format(debug_path)
+        )
 
         projection = [
             Document.COLUMN_DOCUMENT_ID,
@@ -114,28 +284,44 @@ class SAFTree:
             Document.COLUMN_MIME_TYPE
         ]
 
+        # Convertimos tambien los nombres de columnas a str Python para evitar
+        # wrappers Java innecesarios en la llamada JNI.
+        projection = [self._java_string(x) for x in projection]
+
         try:
-            cursor = self.resolver.query(
+            cursor = resolver.query(
                 children_uri, projection, None, None, None
             )
         except Exception as e:
             raise RuntimeError(
                 "SAF: ContentResolver.query() falló en: {}\n"
-                "documentId={}\nURI={}\n{}".format(
-                    debug_path, parent_doc_id, children_uri, e
+                "documentId={}\nchildrenUri={}\nTREE={}\n{}".format(
+                    debug_path,
+                    parent_doc_id,
+                    self._uri_debug(children_uri),
+                    self.tree_uri_text,
+                    e
                 )
             )
 
         if cursor is None:
             raise RuntimeError(
                 "SAF: ContentResolver.query() devolvió NULL en: {}\n"
-                "URI={}".format(debug_path, children_uri)
+                "childrenUri={}\nTREE={}".format(
+                    debug_path,
+                    self._uri_debug(children_uri),
+                    self.tree_uri_text
+                )
             )
 
         try:
-            id_index = cursor.getColumnIndex(Document.COLUMN_DOCUMENT_ID)
-            name_index = cursor.getColumnIndex(Document.COLUMN_DISPLAY_NAME)
-            mime_index = cursor.getColumnIndex(Document.COLUMN_MIME_TYPE)
+            id_col = self._java_string(Document.COLUMN_DOCUMENT_ID)
+            name_col = self._java_string(Document.COLUMN_DISPLAY_NAME)
+            mime_col = self._java_string(Document.COLUMN_MIME_TYPE)
+
+            id_index = cursor.getColumnIndex(id_col)
+            name_index = cursor.getColumnIndex(name_col)
+            mime_index = cursor.getColumnIndex(mime_col)
 
             if id_index < 0 or name_index < 0 or mime_index < 0:
                 raise RuntimeError(
@@ -144,18 +330,24 @@ class SAFTree:
                 )
 
             while cursor.moveToNext():
-                doc_id = cursor.getString(id_index)
-                name = cursor.getString(name_index)
-                mime = cursor.getString(mime_index)
+                doc_id = self._java_string(cursor.getString(id_index))
+                name = self._java_string(cursor.getString(name_index))
+                mime = self._java_string(cursor.getString(mime_index))
 
-                if doc_id is None or str(doc_id) == "":
+                if doc_id is None or not doc_id.strip():
                     raise RuntimeError(
                         "SAF: documento hijo sin documentId en: {}".format(debug_path)
                     )
+                if name is None:
+                    raise RuntimeError(
+                        "SAF: documento hijo sin displayName en: {}\n"
+                        "documentId={}".format(debug_path, doc_id)
+                    )
 
+                doc_id = doc_id.strip()
                 try:
-                    child_uri = DocumentsContract.buildDocumentUriUsingTree(
-                        self.tree_uri, doc_id
+                    raw_child_uri = DocumentsContract.buildDocumentUriUsingTree(
+                        tree_uri, doc_id
                     )
                 except Exception as e:
                     raise RuntimeError(
@@ -163,11 +355,10 @@ class SAFTree:
                         .format(name, debug_path, e)
                     )
 
-                if child_uri is None:
-                    raise RuntimeError(
-                        "SAF: Android devolvió URI nula para '{}' dentro de: {}"
-                        .format(name, debug_path)
-                    )
+                child_uri = self._normalize_uri(
+                    raw_child_uri,
+                    "URI hijo '{}'".format(name)
+                )
 
                 children[name] = {
                     "uri": child_uri,
@@ -179,7 +370,7 @@ class SAFTree:
         finally:
             cursor.close()
 
-        self.cache[key] = children
+        self.cache[cache_key] = children
         return children
 
     def resolve_entry(self, relative_path):
@@ -230,7 +421,8 @@ class SAFTree:
         if uri is None:
             raise FileNotFoundError("No existe en USB: " + relative_path)
 
-        inp = self.resolver.openInputStream(uri)
+        uri = self._normalize_uri(uri, "URI lectura {}".format(relative_path))
+        inp = self._fresh_resolver().openInputStream(uri)
         if inp is None:
             raise IOError("No se pudo abrir: " + relative_path)
 
@@ -252,7 +444,8 @@ class SAFTree:
         if uri is None:
             raise FileNotFoundError("No existe el archivo: " + relative_path)
 
-        out = self.resolver.openOutputStream(uri)
+        uri = self._normalize_uri(uri, "URI escritura {}".format(relative_path))
+        out = self._fresh_resolver().openOutputStream(uri)
         if out is None:
             raise IOError("No se pudo abrir para escritura: " + relative_path)
 
@@ -268,14 +461,16 @@ class SAFTree:
         if parent_uri is None:
             raise FileNotFoundError("No existe carpeta: " + parent_relative)
 
+        parent_uri = self._normalize_uri(
+            parent_uri, "URI carpeta creación {}".format(parent_relative)
+        )
         new_uri = DocumentsContract.createDocument(
-            self.resolver, parent_uri, mime, filename
+            self._fresh_resolver(), parent_uri, mime, filename
         )
         if new_uri is None:
             raise IOError("No se pudo crear: " + filename)
 
-        self.clear_cache()
-        return new_uri
+        return self._normalize_uri(new_uri, "URI archivo creado {}".format(filename))
 
     def write_or_create(self, relative_path, data, mime):
         relative_path = relative_path.replace("\\", "/").strip("/")
@@ -285,7 +480,10 @@ class SAFTree:
 
         existing_uri = self.resolve(relative_path)
         if existing_uri is not None:
-            out = self.resolver.openOutputStream(existing_uri)
+            existing_uri = self._normalize_uri(
+                existing_uri, "URI escritura {}".format(relative_path)
+            )
+            out = self._fresh_resolver().openOutputStream(existing_uri)
             if out is None:
                 raise IOError("No se pudo abrir: " + relative_path)
             try:
@@ -297,7 +495,7 @@ class SAFTree:
             return
 
         new_uri = self.create_file(parent, filename, mime)
-        out = self.resolver.openOutputStream(new_uri)
+        out = self._fresh_resolver().openOutputStream(new_uri)
         if out is None:
             raise IOError("No se pudo abrir archivo nuevo: " + relative_path)
         try:
@@ -718,6 +916,14 @@ class PS202App(App):
             uri = data.getData()
             if uri is None:
                 raise RuntimeError("Android no devolvió ninguna URI.")
+
+            # Re-parseamos la URI recibida del Intent para obtener un objeto
+            # android.net.Uri nuevo y estable antes de usar JNI/SAF.
+            uri_text = SAFTree._java_string(uri)
+            if uri_text is None or not uri_text.strip():
+                raise RuntimeError("Android devolvió una URI vacía.")
+            uri = SAFTree._normalize_uri(uri_text, "URI seleccionada")
+            self.log("TREE URI: {}".format(SAFTree._uri_debug(uri)))
 
             flags = data.getFlags() & (
                 Intent.FLAG_GRANT_READ_URI_PERMISSION
