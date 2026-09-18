@@ -472,6 +472,47 @@ class SAFTree:
 
         return self._normalize_uri(new_uri, "URI archivo creado {}".format(filename))
 
+    def write_or_create_in_folder(self, folder_entry, filename, data, mime,
+                                  existing_entries=None):
+        """Escribe/crea un archivo usando una carpeta ya enumerada por SAF.
+        No vuelve a resolver ni listar la carpeta.
+        """
+        if folder_entry is None:
+            raise FileNotFoundError("Carpeta SAF nula")
+        parent_uri = self._normalize_uri(
+            folder_entry["uri"], "URI carpeta escritura"
+        )
+
+        existing_uri = None
+        if existing_entries is not None:
+            item = existing_entries.get(filename)
+            if item is not None:
+                existing_uri = item.get("uri")
+
+        if existing_uri is None:
+            new_uri = DocumentsContract.createDocument(
+                self._fresh_resolver(), parent_uri, mime, filename
+            )
+            if new_uri is None:
+                raise IOError("No se pudo crear: " + filename)
+            target_uri = self._normalize_uri(
+                new_uri, "URI archivo creado {}".format(filename)
+            )
+        else:
+            target_uri = self._normalize_uri(
+                existing_uri, "URI archivo {}".format(filename)
+            )
+
+        out = self._fresh_resolver().openOutputStream(target_uri)
+        if out is None:
+            raise IOError("No se pudo abrir para escritura: " + filename)
+        try:
+            out.write(data)
+            out.flush()
+        finally:
+            out.close()
+        self.clear_cache()
+
     def write_or_create(self, relative_path, data, mime):
         relative_path = relative_path.replace("\\", "/").strip("/")
         parts = relative_path.split("/")
@@ -546,24 +587,16 @@ def build_image_cache(usb):
     return image_cache
 
 
-def list_rom_files(usb, system, folder_entry=None):
-    folder_path = "roms/{}".format(system)
-    if folder_entry is None:
-        folder_entry = usb.resolve_entry(folder_path)
-    if folder_entry is None:
-        return []
-
-    folder_uri = folder_entry["uri"]
-    folder_doc_id = folder_entry["doc_id"]
+def list_rom_files_from_entries(entries):
+    """Filtra ROMs a partir de UNA enumeración SAF ya realizada."""
     result = []
-    for name, item in usb.list_children(
-        folder_uri, parent_doc_id=folder_doc_id, debug_path=folder_path
-    ).items():
+    for name, item in entries.items():
         if item["is_dir"]:
             continue
-        if name.lower() == "gamelist.xml":
+        lower = name.lower()
+        if lower == "gamelist.xml":
             continue
-        if name.lower().endswith(ROM_EXTS):
+        if lower.endswith(ROM_EXTS):
             result.append(name)
     return result
 
@@ -575,6 +608,30 @@ def process_database(usb, local_db, log):
         conn = sqlite3.connect(local_db)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
+
+        # IMPORTANTE: SAF es costoso. Enumeramos cada carpeta ROM UNA sola vez
+        # y conservamos el resultado en memoria Python para usarlo tanto en
+        # SQLite como en la generación de gamelist.xml.
+        log("Leyendo carpetas ROM UNA sola vez para los gamelist...")
+        rom_entries = {}
+        rom_files = {}
+        rom_folder_entries = {}
+        for system in SYSTEM_IDS:
+            folder_entry = usb.resolve_entry("roms/{}".format(system))
+            if folder_entry is None:
+                continue
+            folder_path = "roms/{}".format(system)
+            entries = usb.list_children(
+                folder_entry["uri"],
+                parent_doc_id=folder_entry["doc_id"],
+                debug_path=folder_path
+            )
+            rom_entries[system] = entries
+            rom_folder_entries[system] = folder_entry
+            rom_files[system] = list_rom_files_from_entries(entries)
+            log("[ROM] {}: {} ROMs (1 lectura SAF)".format(
+                system, len(rom_files[system])
+            ))
 
         log("Creando cache de imágenes...")
         image_cache = build_image_cache(usb)
@@ -644,14 +701,13 @@ def process_database(usb, local_db, log):
         inserted = 0
 
         for system in SYSTEM_IDS:
-            folder_entry = usb.resolve_entry("roms/{}".format(system))
+            folder_entry = rom_folder_entries.get(system)
             if folder_entry is None:
                 continue
             if system not in templates:
                 continue
 
-            roms = list_rom_files(usb, system, folder_entry=folder_entry)
-            log("[ROM] {}: {} archivos (una sola resolución SAF)".format(system, len(roms)))
+            roms = rom_files.get(system, [])
 
             for fname in roms:
                 rel = "roms/{}/{}".format(system, fname)
@@ -729,7 +785,7 @@ def process_database(usb, local_db, log):
                 current, total_systems, system
             ))
 
-            folder_entry = usb.resolve_entry("roms/{}".format(system))
+            folder_entry = rom_folder_entries.get(system)
             if folder_entry is None:
                 continue
 
@@ -774,10 +830,14 @@ def process_database(usb, local_db, log):
                 root, encoding="utf-8", xml_declaration=True
             )
 
-            usb.write_or_create(
-                "roms/{}/gamelist.xml".format(system),
+            # La carpeta y sus hijos ya fueron leídos al principio.
+            # Reutilizamos esa información: NO hacemos otra consulta SAF.
+            usb.write_or_create_in_folder(
+                folder_entry,
+                "gamelist.xml",
                 xml_data,
-                "application/xml"
+                "application/xml",
+                existing_entries=rom_entries.get(system)
             )
 
         conn.commit()
