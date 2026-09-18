@@ -5,6 +5,7 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
+from kivy.core.window import Window
 
 from jnius import autoclass
 from android import activity
@@ -60,24 +61,52 @@ class SAFTree:
             raise RuntimeError("SAF: no se pudo construir la URI raíz de la USB.")
         return uri
 
-    def list_children(self, directory_uri=None, parent_doc_id=None):
+    def list_children(self, directory_uri=None, parent_doc_id=None, debug_path="/"):
         key = str(directory_uri) if directory_uri is not None else "DOCID:" + str(parent_doc_id)
         if key in self.cache:
             return self.cache[key]
 
+        if self.tree_uri is None:
+            raise RuntimeError(
+                "SAF: la URI raíz de la USB es nula al listar: {}".format(debug_path)
+            )
+
         if parent_doc_id is None:
             if directory_uri is None:
-                raise RuntimeError("SAF: carpeta URI nula al listar contenido.")
-            parent_doc_id = DocumentsContract.getDocumentId(directory_uri)
+                raise RuntimeError(
+                    "SAF: carpeta URI nula al listar: {}".format(debug_path)
+                )
+            try:
+                parent_doc_id = DocumentsContract.getDocumentId(directory_uri)
+            except Exception as e:
+                raise RuntimeError(
+                    "SAF: no se pudo obtener documentId de: {}\n{}".format(
+                        debug_path, e
+                    )
+                )
 
         if parent_doc_id is None or str(parent_doc_id) == "":
-            raise RuntimeError("SAF: Android no devolvió el documentId de la carpeta.")
+            raise RuntimeError(
+                "SAF: documentId vacío para la carpeta: {}".format(debug_path)
+            )
 
         children = {}
-        children_uri = DocumentsContract.buildChildDocumentsUriUsingTree(
-            self.tree_uri,
-            parent_doc_id
-        )
+        try:
+            children_uri = DocumentsContract.buildChildDocumentsUriUsingTree(
+                self.tree_uri,
+                parent_doc_id
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "SAF: no se pudo construir URI de hijos para: {}\n"
+                "documentId={}\n{}".format(debug_path, parent_doc_id, e)
+            )
+
+        if children_uri is None:
+            raise RuntimeError(
+                "SAF: Android devolvió URI de hijos nula para: {}\n"
+                "documentId={}".format(debug_path, parent_doc_id)
+            )
 
         projection = [
             Document.COLUMN_DOCUMENT_ID,
@@ -85,26 +114,60 @@ class SAFTree:
             Document.COLUMN_MIME_TYPE
         ]
 
-        cursor = self.resolver.query(
-            children_uri, projection, None, None, None
-        )
+        try:
+            cursor = self.resolver.query(
+                children_uri, projection, None, None, None
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "SAF: ContentResolver.query() falló en: {}\n"
+                "documentId={}\nURI={}\n{}".format(
+                    debug_path, parent_doc_id, children_uri, e
+                )
+            )
 
         if cursor is None:
-            return children
+            raise RuntimeError(
+                "SAF: ContentResolver.query() devolvió NULL en: {}\n"
+                "URI={}".format(debug_path, children_uri)
+            )
 
         try:
             id_index = cursor.getColumnIndex(Document.COLUMN_DOCUMENT_ID)
             name_index = cursor.getColumnIndex(Document.COLUMN_DISPLAY_NAME)
             mime_index = cursor.getColumnIndex(Document.COLUMN_MIME_TYPE)
 
+            if id_index < 0 or name_index < 0 or mime_index < 0:
+                raise RuntimeError(
+                    "SAF: el proveedor USB no devolvió las columnas esperadas en: {}"
+                    .format(debug_path)
+                )
+
             while cursor.moveToNext():
                 doc_id = cursor.getString(id_index)
                 name = cursor.getString(name_index)
                 mime = cursor.getString(mime_index)
 
-                child_uri = DocumentsContract.buildDocumentUriUsingTree(
-                    self.tree_uri, doc_id
-                )
+                if doc_id is None or str(doc_id) == "":
+                    raise RuntimeError(
+                        "SAF: documento hijo sin documentId en: {}".format(debug_path)
+                    )
+
+                try:
+                    child_uri = DocumentsContract.buildDocumentUriUsingTree(
+                        self.tree_uri, doc_id
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        "SAF: no se pudo construir URI para '{}' dentro de: {}\n{}"
+                        .format(name, debug_path, e)
+                    )
+
+                if child_uri is None:
+                    raise RuntimeError(
+                        "SAF: Android devolvió URI nula para '{}' dentro de: {}"
+                        .format(name, debug_path)
+                    )
 
                 children[name] = {
                     "uri": child_uri,
@@ -119,35 +182,48 @@ class SAFTree:
         self.cache[key] = children
         return children
 
-    def resolve(self, relative_path):
+    def resolve_entry(self, relative_path):
+        """Resuelve una ruta SAF una sola vez y devuelve URI + documentId."""
         relative_path = relative_path.replace("\\", "/").strip("/")
         if not relative_path:
-            return self.root_uri()
+            uri = self.root_uri()
+            return {"uri": uri, "doc_id": self.root_doc_id, "name": "",
+                    "mime": self.DIR_MIME, "is_dir": True}
 
         current_uri = self.root_uri()
         current_doc_id = self.root_doc_id
+        current_path = []
 
         if current_uri is None or current_doc_id is None:
             raise RuntimeError("SAF: no se pudo obtener la raíz de la USB.")
 
         for part in relative_path.split("/"):
+            current_path.append(part)
+            debug_path = "/" + "/".join(current_path)
+
             children = self.list_children(
                 current_uri,
-                parent_doc_id=current_doc_id
+                parent_doc_id=current_doc_id,
+                debug_path=debug_path.rsplit("/", 1)[0] or "/"
             )
             item = children.get(part)
             if item is None:
                 return None
 
-            current_uri = item["uri"]
+            current_uri = item.get("uri")
             current_doc_id = item.get("doc_id")
 
             if current_uri is None or current_doc_id is None:
                 raise RuntimeError(
-                    "SAF: Android devolvió una URI/documentId nulo para: " + part
+                    "SAF: Android devolvió una URI/documentId nulo para: "
+                    + debug_path
                 )
 
-        return current_uri
+        return item
+
+    def resolve(self, relative_path):
+        entry = self.resolve_entry(relative_path)
+        return None if entry is None else entry.get("uri")
 
     def read_bytes(self, relative_path):
         uri = self.resolve(relative_path)
@@ -255,11 +331,15 @@ def build_image_cache(usb):
     for system in SYSTEM_IDS:
         image_cache[system] = {}
         images_path = "roms/{}/images".format(system)
-        images_uri = usb.resolve(images_path)
-        if images_uri is None:
+        images_entry = usb.resolve_entry(images_path)
+        if images_entry is None:
             continue
 
-        for name, item in usb.list_children(images_uri).items():
+        images_uri = images_entry["uri"]
+        images_doc_id = images_entry["doc_id"]
+        for name, item in usb.list_children(
+            images_uri, parent_doc_id=images_doc_id, debug_path=images_path
+        ).items():
             if item["is_dir"]:
                 continue
             base, ext = os.path.splitext(name)
@@ -268,13 +348,19 @@ def build_image_cache(usb):
     return image_cache
 
 
-def list_rom_files(usb, system):
-    folder_uri = usb.resolve("roms/{}".format(system))
-    if folder_uri is None:
+def list_rom_files(usb, system, folder_entry=None):
+    folder_path = "roms/{}".format(system)
+    if folder_entry is None:
+        folder_entry = usb.resolve_entry(folder_path)
+    if folder_entry is None:
         return []
 
+    folder_uri = folder_entry["uri"]
+    folder_doc_id = folder_entry["doc_id"]
     result = []
-    for name, item in usb.list_children(folder_uri).items():
+    for name, item in usb.list_children(
+        folder_uri, parent_doc_id=folder_doc_id, debug_path=folder_path
+    ).items():
         if item["is_dir"]:
             continue
         if name.lower() == "gamelist.xml":
@@ -360,13 +446,14 @@ def process_database(usb, local_db, log):
         inserted = 0
 
         for system in SYSTEM_IDS:
-            if usb.resolve("roms/{}".format(system)) is None:
+            folder_entry = usb.resolve_entry("roms/{}".format(system))
+            if folder_entry is None:
                 continue
             if system not in templates:
                 continue
 
-            roms = list_rom_files(usb, system)
-            log("[ROM] {}: {} archivos".format(system, len(roms)))
+            roms = list_rom_files(usb, system, folder_entry=folder_entry)
+            log("[ROM] {}: {} archivos (una sola resolución SAF)".format(system, len(roms)))
 
             for fname in roms:
                 rel = "roms/{}/{}".format(system, fname)
@@ -444,7 +531,8 @@ def process_database(usb, local_db, log):
                 current, total_systems, system
             ))
 
-            if usb.resolve("roms/{}".format(system)) is None:
+            folder_entry = usb.resolve_entry("roms/{}".format(system))
+            if folder_entry is None:
                 continue
 
             root = ET.Element("gameList")
@@ -512,37 +600,55 @@ class PS202App(App):
 
         root = BoxLayout(
             orientation="vertical",
-            padding=18,
-            spacing=12
+            padding=(18, 14),
+            spacing=10
         )
 
         self.status = Label(
-            text="PS202 Game Manager\nSelecciona la raíz de Unidad USB.\n\nNo se copiarán ROM ni imágenes.",
-            font_size="18sp"
+            text="PS202 Game Manager\nSelecciona la raíz de Unidad USB.\nNo se copiarán ROM ni imágenes.",
+            font_size="18sp",
+            size_hint_y=None,
+            height=86,
+            halign="center",
+            valign="middle",
+            text_size=(Window.width - 36, 86),
         )
         root.add_widget(self.status)
 
         self.button = Button(
             text="SELECCIONAR UNIDAD USB",
             size_hint_y=None,
-            height=60
+            height=58,
+            font_size="16sp"
         )
         self.button.bind(on_release=self.select_usb)
         root.add_widget(self.button)
 
-        scroll = ScrollView()
+        self.log_scroll = ScrollView(
+            do_scroll_x=False,
+            do_scroll_y=True,
+            bar_width="6dp"
+        )
         self.log_label = Label(
             text="",
             size_hint_y=None,
+            size_hint_x=1,
             halign="left",
             valign="top",
-            font_size="14sp"
+            font_size="13sp",
+            padding=(6, 8),
+            text_size=(Window.width - 48, None)
         )
         self.log_label.bind(
-            texture_size=lambda obj, size: setattr(obj, "height", size[1])
+            width=lambda obj, value: setattr(
+                obj, "text_size", (max(1, value - 12), None)
+            ),
+            texture_size=lambda obj, size: setattr(
+                obj, "height", max(size[1], 20)
+            )
         )
-        scroll.add_widget(self.log_label)
-        root.add_widget(scroll)
+        self.log_scroll.add_widget(self.log_label)
+        root.add_widget(self.log_scroll)
 
         self.usb = None
         self.local_db = None
@@ -556,6 +662,9 @@ class PS202App(App):
 
     def _append_log(self, text):
         self.log_label.text += text + "\n"
+        Clock.schedule_once(
+            lambda dt: setattr(self.log_scroll, "scroll_y", 0), 0
+        )
 
     def select_usb(self, *_):
         self.button.disabled = True
