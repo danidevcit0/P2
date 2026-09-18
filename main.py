@@ -35,7 +35,7 @@ ROM_EXTS = (
 )
 
 Intent = autoclass("android.content.Intent")
-Activity = autoclass("android.app.Activity")
+PythonActivity = autoclass("org.kivy.android.PythonActivity")
 DocumentsContract = autoclass("android.provider.DocumentsContract")
 Document = autoclass("android.provider.DocumentsContract$Document")
 Uri = autoclass("android.net.Uri")
@@ -182,7 +182,7 @@ class SAFTree:
 
     def _fresh_resolver(self):
         # No conservamos ContentResolver obtenido en otro hilo.
-        activity_obj = Activity.mActivity
+        activity_obj = PythonActivity.mActivity
         if activity_obj is None:
             raise RuntimeError("SAF: PythonActivity.mActivity es NULL.")
         resolver = activity_obj.getContentResolver()
