@@ -13,6 +13,7 @@ import os
 import sqlite3
 import tempfile
 import traceback
+import threading
 import xml.etree.ElementTree as ET
 
 
@@ -491,7 +492,7 @@ class PS202App(App):
         )
 
         self.status = Label(
-            text="PS202 Game Manager\nSelecciona la raíz de Unidad USB.",
+            text="PS202 Game Manager\nSelecciona la raíz de Unidad USB.\n\nNo se copiarán ROM ni imágenes.",
             font_size="18sp"
         )
         root.add_widget(self.status)
@@ -613,7 +614,7 @@ class PS202App(App):
             self.log("Encontrados gameconsole.db y roms/.")
 
             Clock.schedule_once(
-                lambda dt: self.run_process(), 0.2
+                lambda dt: self.start_process_worker(), 0.2
             )
 
         except Exception:
@@ -621,38 +622,56 @@ class PS202App(App):
             self.log("ERROR procesando selección:")
             self.log(traceback.format_exc())
 
+    def start_process_worker(self):
+        self.button.disabled = True
+        self.status.text = "Procesando USB...\nNo cierres la aplicación."
+        threading.Thread(
+            target=self.run_process,
+            daemon=True
+        ).start()
+
+    def _finish_success(self):
+        self.status.text = "FINALIZADO"
+        self.log("")
+        self.log("================================")
+        self.log("FINALIZADO CORRECTAMENTE")
+        self.log("================================")
+
+    def _finish_error(self, error_text):
+        self.status.text = "ERROR"
+        self.log("ERROR DURANTE EL PROCESO:")
+        self.log(error_text)
+
     def run_process(self):
+        error_text = None
         try:
             fd, self.local_db = tempfile.mkstemp(
                 prefix="ps202_", suffix=".db"
             )
             os.close(fd)
 
-            self.log("Copiando SOLO gameconsole.db al almacenamiento privado...")
+            self.log("PASO 1/5 — Copiando SOLO gameconsole.db al almacenamiento temporal...")
             copy_usb_to_local(
                 self.usb, "gameconsole.db", self.local_db
             )
 
-            self.log("Procesando SQLite...")
+            self.log("PASO 2/5 — Procesando SQLite...")
             process_database(
                 self.usb, self.local_db, self.log
             )
 
-            self.log("Escribiendo gameconsole.db modificado al USB...")
+            self.log("PASO 4/5 — Escribiendo SOLO gameconsole.db modificado en la USB...")
             copy_local_to_usb(
                 self.usb, self.local_db, "gameconsole.db"
             )
 
-            self.status.text = "FINALIZADO"
-            self.log("")
-            self.log("================================")
-            self.log("FINALIZADO CORRECTAMENTE")
-            self.log("================================")
+            Clock.schedule_once(lambda dt: self._finish_success(), 0)
 
         except Exception:
-            self.status.text = "ERROR"
-            self.log("ERROR DURANTE EL PROCESO:")
-            self.log(traceback.format_exc())
+            error_text = traceback.format_exc()
+            Clock.schedule_once(
+                lambda dt, e=error_text: self._finish_error(e), 0
+            )
 
         finally:
             if self.local_db:
@@ -661,7 +680,9 @@ class PS202App(App):
                         os.remove(self.local_db)
                 except Exception:
                     pass
-            self.button.disabled = False
+            Clock.schedule_once(
+                lambda dt: setattr(self.button, "disabled", False), 0
+            )
 
 
 if __name__ == "__main__":
