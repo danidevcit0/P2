@@ -209,42 +209,18 @@ class SAFTree:
 
         return self._normalize_uri(raw_uri, "URI raíz")
 
-    def list_children(self, directory_uri=None, parent_doc_id=None, debug_path="/"):
-        if directory_uri is not None:
-            directory_uri = self._normalize_uri(
-                directory_uri, "URI carpeta {}".format(debug_path)
-            )
-            cache_key = "URI:" + self._java_string(directory_uri)
-        else:
-            cache_key = "DOCID:" + str(parent_doc_id)
+    def list_children(self, parent_doc_id=None, debug_path="/"):
+        """Enumera UNA carpeta SAF y devuelve solo metadatos Python.
 
-        if cache_key in self.cache:
-            return self.cache[cache_key]
-
-        if not self.tree_uri_text:
-            raise RuntimeError(
-                "SAF: la URI raíz de la USB es nula/vacía al listar: {}".format(
-                    debug_path
-                )
-            )
-
-        # Todos los objetos Java usados en query() se crean en ESTE hilo.
-        tree_uri = self._fresh_tree_uri()
-        resolver = self._fresh_resolver()
-
+        No crea una Uri Java por cada hijo. Esto es deliberado: una carpeta
+        con miles de ROMs no debe generar miles de wrappers JNI que luego no
+        necesitamos. La Uri de un hijo se construye solo cuando ese hijo se
+        necesita realmente (por ejemplo, una carpeta o gamelist.xml).
+        """
         if parent_doc_id is None:
-            if directory_uri is None:
-                raise RuntimeError(
-                    "SAF: carpeta URI nula al listar: {}".format(debug_path)
-                )
-            try:
-                parent_doc_id = DocumentsContract.getDocumentId(directory_uri)
-            except Exception as e:
-                raise RuntimeError(
-                    "SAF: no se pudo obtener documentId de: {}\n{}".format(
-                        debug_path, e
-                    )
-                )
+            raise RuntimeError(
+                "SAF: documentId nulo al listar: {}".format(debug_path)
+            )
 
         parent_doc_id = self._java_string(parent_doc_id)
         if parent_doc_id is None or not parent_doc_id.strip():
@@ -253,54 +229,44 @@ class SAFTree:
             )
         parent_doc_id = parent_doc_id.strip()
 
-        children = {}
+        cache_key = "DOCID:" + parent_doc_id
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        tree_uri = self._fresh_tree_uri()
+        resolver = self._fresh_resolver()
+
         try:
-            raw_children_uri = DocumentsContract.buildChildDocumentsUriUsingTree(
-                tree_uri,
-                parent_doc_id
+            children_uri = DocumentsContract.buildChildDocumentsUriUsingTree(
+                tree_uri, parent_doc_id
             )
         except Exception as e:
             raise RuntimeError(
                 "SAF: no se pudo construir URI de hijos para: {}\n"
                 "documentId={}\nTREE={}\n{}".format(
-                    debug_path,
-                    parent_doc_id,
-                    self.tree_uri_text,
-                    e
+                    debug_path, parent_doc_id, self.tree_uri_text, e
                 )
             )
 
-        # IMPORTANTE: crear una URI nueva desde texto antes de query().
-        # El traceback anterior mostraba un wrapper android.net.Uri en Python,
-        # pero ContentResolver.query() terminaba recibiendo uri=NULL.
         children_uri = self._normalize_uri(
-            raw_children_uri,
-            "URI hijos {}".format(debug_path)
+            children_uri, "URI hijos {}".format(debug_path)
         )
 
         projection = [
-            Document.COLUMN_DOCUMENT_ID,
-            Document.COLUMN_DISPLAY_NAME,
-            Document.COLUMN_MIME_TYPE
+            self._java_string(Document.COLUMN_DOCUMENT_ID),
+            self._java_string(Document.COLUMN_DISPLAY_NAME),
+            self._java_string(Document.COLUMN_MIME_TYPE),
         ]
 
-        # Convertimos tambien los nombres de columnas a str Python para evitar
-        # wrappers Java innecesarios en la llamada JNI.
-        projection = [self._java_string(x) for x in projection]
-
         try:
-            cursor = resolver.query(
-                children_uri, projection, None, None, None
-            )
+            cursor = resolver.query(children_uri, projection, None, None, None)
         except Exception as e:
             raise RuntimeError(
                 "SAF: ContentResolver.query() falló en: {}\n"
                 "documentId={}\nchildrenUri={}\nTREE={}\n{}".format(
-                    debug_path,
-                    parent_doc_id,
-                    self._uri_debug(children_uri),
-                    self.tree_uri_text,
-                    e
+                    debug_path, parent_doc_id,
+                    self._uri_debug(children_uri), self.tree_uri_text, e
                 )
             )
 
@@ -308,20 +274,15 @@ class SAFTree:
             raise RuntimeError(
                 "SAF: ContentResolver.query() devolvió NULL en: {}\n"
                 "childrenUri={}\nTREE={}".format(
-                    debug_path,
-                    self._uri_debug(children_uri),
-                    self.tree_uri_text
+                    debug_path, self._uri_debug(children_uri), self.tree_uri_text
                 )
             )
 
+        children = {}
         try:
-            id_col = self._java_string(Document.COLUMN_DOCUMENT_ID)
-            name_col = self._java_string(Document.COLUMN_DISPLAY_NAME)
-            mime_col = self._java_string(Document.COLUMN_MIME_TYPE)
-
-            id_index = cursor.getColumnIndex(id_col)
-            name_index = cursor.getColumnIndex(name_col)
-            mime_index = cursor.getColumnIndex(mime_col)
+            id_index = cursor.getColumnIndex(projection[0])
+            name_index = cursor.getColumnIndex(projection[1])
+            mime_index = cursor.getColumnIndex(projection[2])
 
             if id_index < 0 or name_index < 0 or mime_index < 0:
                 raise RuntimeError(
@@ -345,27 +306,11 @@ class SAFTree:
                     )
 
                 doc_id = doc_id.strip()
-                try:
-                    raw_child_uri = DocumentsContract.buildDocumentUriUsingTree(
-                        tree_uri, doc_id
-                    )
-                except Exception as e:
-                    raise RuntimeError(
-                        "SAF: no se pudo construir URI para '{}' dentro de: {}\n{}"
-                        .format(name, debug_path, e)
-                    )
-
-                child_uri = self._normalize_uri(
-                    raw_child_uri,
-                    "URI hijo '{}'".format(name)
-                )
-
                 children[name] = {
-                    "uri": child_uri,
                     "doc_id": doc_id,
                     "name": name,
                     "mime": mime,
-                    "is_dir": mime == self.DIR_MIME
+                    "is_dir": mime == self.DIR_MIME,
                 }
         finally:
             cursor.close()
@@ -373,43 +318,47 @@ class SAFTree:
         self.cache[cache_key] = children
         return children
 
+    def _child_uri(self, doc_id, label="URI hijo"):
+        doc_id = self._java_string(doc_id)
+        if doc_id is None or not doc_id.strip():
+            raise RuntimeError("SAF: documentId vacío para {}.".format(label))
+        raw = DocumentsContract.buildDocumentUriUsingTree(
+            self._fresh_tree_uri(), doc_id.strip()
+        )
+        return self._normalize_uri(raw, label)
+
     def resolve_entry(self, relative_path):
-        """Resuelve una ruta SAF una sola vez y devuelve URI + documentId."""
+        """Resuelve una ruta SAF. Solo crea Uris Java para los componentes necesarios."""
         relative_path = relative_path.replace("\\", "/").strip("/")
         if not relative_path:
-            uri = self.root_uri()
-            return {"uri": uri, "doc_id": self.root_doc_id, "name": "",
-                    "mime": self.DIR_MIME, "is_dir": True}
+            return {
+                "uri": self.root_uri(),
+                "doc_id": self.root_doc_id,
+                "name": "",
+                "mime": self.DIR_MIME,
+                "is_dir": True,
+            }
 
-        current_uri = self.root_uri()
         current_doc_id = self.root_doc_id
+        item = None
         current_path = []
-
-        if current_uri is None or current_doc_id is None:
-            raise RuntimeError("SAF: no se pudo obtener la raíz de la USB.")
 
         for part in relative_path.split("/"):
             current_path.append(part)
             debug_path = "/" + "/".join(current_path)
-
             children = self.list_children(
-                current_uri,
                 parent_doc_id=current_doc_id,
-                debug_path=debug_path.rsplit("/", 1)[0] or "/"
+                debug_path="/" + "/".join(current_path[:-1]) or "/"
             )
             item = children.get(part)
             if item is None:
                 return None
+            current_doc_id = item["doc_id"]
 
-            current_uri = item.get("uri")
-            current_doc_id = item.get("doc_id")
-
-            if current_uri is None or current_doc_id is None:
-                raise RuntimeError(
-                    "SAF: Android devolvió una URI/documentId nulo para: "
-                    + debug_path
-                )
-
+        item = dict(item)
+        item["uri"] = self._child_uri(
+            item["doc_id"], "URI {}".format(relative_path)
+        )
         return item
 
     def resolve(self, relative_path):
@@ -474,34 +423,35 @@ class SAFTree:
 
     def write_or_create_in_folder(self, folder_entry, filename, data, mime,
                                   existing_entries=None):
-        """Escribe/crea un archivo usando una carpeta ya enumerada por SAF.
-        No vuelve a resolver ni listar la carpeta.
+        """Escribe/crea un archivo usando una carpeta ya enumerada.
+        No vuelve a listar ni resolver la carpeta.
         """
         if folder_entry is None:
             raise FileNotFoundError("Carpeta SAF nula")
-        parent_uri = self._normalize_uri(
-            folder_entry["uri"], "URI carpeta escritura"
+
+        parent_uri = self._child_uri(
+            folder_entry["doc_id"], "URI carpeta escritura"
         )
 
         existing_uri = None
         if existing_entries is not None:
             item = existing_entries.get(filename)
             if item is not None:
-                existing_uri = item.get("uri")
+                existing_uri = self._child_uri(
+                    item["doc_id"], "URI archivo {}".format(filename)
+                )
 
         if existing_uri is None:
-            new_uri = DocumentsContract.createDocument(
+            target_uri = DocumentsContract.createDocument(
                 self._fresh_resolver(), parent_uri, mime, filename
             )
-            if new_uri is None:
+            if target_uri is None:
                 raise IOError("No se pudo crear: " + filename)
             target_uri = self._normalize_uri(
-                new_uri, "URI archivo creado {}".format(filename)
+                target_uri, "URI archivo creado {}".format(filename)
             )
         else:
-            target_uri = self._normalize_uri(
-                existing_uri, "URI archivo {}".format(filename)
-            )
+            target_uri = existing_uri
 
         out = self._fresh_resolver().openOutputStream(target_uri)
         if out is None:
@@ -565,25 +515,36 @@ def find_image_cached(system, title, image_cache):
     )
 
 
-def build_image_cache(usb):
+def build_image_cache(usb, rom_folder_entries):
     image_cache = {}
     for system in SYSTEM_IDS:
         image_cache[system] = {}
-        images_path = "roms/{}/images".format(system)
-        images_entry = usb.resolve_entry(images_path)
-        if images_entry is None:
+        rom_folder = rom_folder_entries.get(system)
+        if rom_folder is None:
             continue
 
-        images_uri = images_entry["uri"]
-        images_doc_id = images_entry["doc_id"]
-        for name, item in usb.list_children(
-            images_uri, parent_doc_id=images_doc_id, debug_path=images_path
-        ).items():
+        # La carpeta images es un hijo de roms/<system>. La enumeración de
+        # roms/<system> ya se hizo una sola vez, por lo que aquí solo
+        # resolvemos y leemos la carpeta images cuando realmente existe.
+        system_entries = usb.list_children(
+            parent_doc_id=rom_folder["doc_id"],
+            debug_path="roms/{}/".format(system)
+        )
+        images_item = system_entries.get("images")
+        if images_item is None or not images_item["is_dir"]:
+            continue
+
+        image_entries = usb.list_children(
+            parent_doc_id=images_item["doc_id"],
+            debug_path="roms/{}/images".format(system)
+        )
+        for name, item in image_entries.items():
             if item["is_dir"]:
                 continue
             base, ext = os.path.splitext(name)
             if ext.lower() in IMAGE_EXTS:
                 image_cache[system][base.strip().lower()] = name
+
     return image_cache
 
 
@@ -622,7 +583,6 @@ def process_database(usb, local_db, log):
                 continue
             folder_path = "roms/{}".format(system)
             entries = usb.list_children(
-                folder_entry["uri"],
                 parent_doc_id=folder_entry["doc_id"],
                 debug_path=folder_path
             )
@@ -634,7 +594,7 @@ def process_database(usb, local_db, log):
             ))
 
         log("Creando cache de imágenes...")
-        image_cache = build_image_cache(usb)
+        image_cache = build_image_cache(usb, rom_folder_entries)
 
         templates = {}
         for sysname in SYSTEM_IDS:
@@ -853,9 +813,7 @@ def process_database(usb, local_db, log):
 
 class PS202App(App):
     def build(self):
-        global MainActivity
-        MainActivity = autoclass("org.kivy.android.PythonActivity")
-
+        
         root = BoxLayout(
             orientation="vertical",
             padding=(18, 14),
@@ -941,9 +899,12 @@ class PS202App(App):
                 | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
             )
 
-            MainActivity.mActivity.startActivityForResult(
-                intent, REQUEST_USB_TREE
-            )
+            self.log("Lanzando ACTION_OPEN_DOCUMENT_TREE...")
+            # Usamos el helper de python-for-android para lanzar el selector
+            # desde la Activity actual, evitando depender de mActivity para
+            # esta llamada concreta.
+            activity.startActivityForResult(intent, REQUEST_USB_TREE)
+            self.log("Selector Android lanzado.")
 
         except Exception:
             try:
@@ -967,7 +928,7 @@ class PS202App(App):
         except Exception:
             pass
 
-        if result_code != Activity.RESULT_OK or data is None:
+        if result_code != -1 or data is None:
             self.button.disabled = False
             self.log("Selección cancelada.")
             return
@@ -991,7 +952,7 @@ class PS202App(App):
             )
 
             try:
-                MainActivity.mActivity.getContentResolver().takePersistableUriPermission(
+                PythonActivity.mActivity.getContentResolver().takePersistableUriPermission(
                     uri, flags
                 )
             except Exception as e:
