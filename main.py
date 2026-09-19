@@ -900,10 +900,12 @@ class PS202App(App):
             )
 
             self.log("Lanzando ACTION_OPEN_DOCUMENT_TREE...")
-            # Usamos el helper de python-for-android para lanzar el selector
-            # desde la Activity actual, evitando depender de mActivity para
-            # esta llamada concreta.
-            activity.startActivityForResult(intent, REQUEST_USB_TREE)
+            # android.activity no expone startActivityForResult en esta
+            # versión de python-for-android. La Activity real de Kivy sí.
+            current_activity = PythonActivity.mActivity
+            if current_activity is None:
+                raise RuntimeError("PythonActivity.mActivity es NULL.")
+            current_activity.startActivityForResult(intent, REQUEST_USB_TREE)
             self.log("Selector Android lanzado.")
 
         except Exception:
